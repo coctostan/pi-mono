@@ -1,7 +1,7 @@
 ---
 id: 1
 type: feature
-status: in-progress
+status: done
 created: 2026-02-24T18:50:00.000Z
 ---
 

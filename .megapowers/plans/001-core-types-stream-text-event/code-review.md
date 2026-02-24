@@ -1,30 +1,27 @@
-# Plan Review Findings — 001-core-types-stream-text-event
+## Findings
 
-## 1. Coverage
+### Critical
+None
 
-- **AC1–AC5:** Covered by Task 1 via additions to `packages/agent/src/types.ts` and type-usage tests in `packages/agent/test/stream-text-types.test.ts`.
-- **AC6 (public import path):** **Gap / mismatch.** Spec says `import { ... } from "@mariozechner/pi-agent"`, but this repo’s package name is `@mariozechner/pi-agent-core` (see `packages/agent/package.json`). There is no `tsconfig` path alias for `@mariozechner/pi-agent`. As written, the plan cannot truly verify AC6.
+### Important
+1. **Out-of-scope runtime changes are included in this issue’s diff**.
+   - Spec explicitly says this is a **types-only** change in `packages/agent/src/types.ts`.
+   - Branch diff from merge-base includes an additional runtime data file:
+     - `packages/ai/src/models.generated.ts`
+   - Evidence:
+     - `git diff --name-only <merge-base>..HEAD -- packages` shows:
+       - `packages/agent/src/types.ts`
+       - `packages/agent/test/stream-text-types.test.ts`
+       - `packages/ai/src/models.generated.ts`
+     - `git diff <merge-base>..HEAD -- packages/ai/src/models.generated.ts` shows multiple model catalog changes (e.g., hunks at `@@ -5882`, `@@ -6845`, `@@ -9497`, `@@ -9990`, `@@ -10026`).
+   - Why this matters: these are unrelated behavioral/data changes and increase merge risk for issue `001-core-types-stream-text-event`.
+   - Required action: remove/split `packages/ai/src/models.generated.ts` changes from this issue before merge.
 
-## 2. Ordering
+### Minor
+1. `packages/agent/test/stream-text-types.test.ts` includes a discriminated-union narrowing test that relies mostly on assignment checks inside runtime branches (`lines 44-52`).
+   - This works, but a dedicated type assertion helper (e.g., `expectTypeOf`) would make intent clearer for future maintainers.
 
-- Single task; no dependency/order issues.
+## Assessment
+needs-rework
 
-## 3. Completeness / Execution Risk
-
-### Task 1 issues
-
-1. **Violates repo rule: “NEVER use inline imports”**
-   - The plan’s test uses `import("@mariozechner/pi-ai").TextContent` in a type position.
-   - Fix: add top-level `import type { TextContent, ImageContent } from "@mariozechner/pi-ai";` and reference those types directly.
-
-2. **Incorrect `ImageContent` shape in test**
-   - Test uses `{ type: "image", source: { type: "url", url: ... } }`.
-   - Actual `ImageContent` is `{ type: "image", data: string; mimeType: string }` (see `packages/ai/src/types.ts`).
-   - Fix: use e.g. `{ type: "image", data: "AA==", mimeType: "image/png" }`.
-
-3. **AC6 import path should be clarified**
-   - Recommended: update spec/plan to assert public export via `@mariozechner/pi-agent-core` (the actual package), or change criterion to “exported from package entrypoint (`src/index.ts`)” and verify via `import type { StreamTextEvent } from "../src/index.js"`.
-
-## Verdict: revise
-
-The approach is correct and close, but Task 1’s test code needs adjustments (inline import rule + `ImageContent` shape), and AC6/spec import path likely needs correction to match the actual package name.
+The agent types implementation itself is clean and aligned with the spec (`packages/agent/src/types.ts`). However, the overall change set is not review-ready for merge because it includes unrelated changes in `packages/ai/src/models.generated.ts`, which violates the issue scope (types-only). Recommend returning to implement phase to isolate/split the diff, then re-review.
