@@ -2,12 +2,32 @@
   "version": 1,
   "activeIssue": "002-agent-loop-stream-intercept",
   "workflow": "feature",
-  "phase": "spec",
+  "phase": "review",
   "phaseHistory": [
     {
       "from": "brainstorm",
       "to": "spec",
       "timestamp": 1771963630525
+    },
+    {
+      "from": "spec",
+      "to": "plan",
+      "timestamp": 1771963935967
+    },
+    {
+      "from": "plan",
+      "to": "review",
+      "timestamp": 1771964091199
+    },
+    {
+      "from": "review",
+      "to": "plan",
+      "timestamp": 1771965019514
+    },
+    {
+      "from": "plan",
+      "to": "review",
+      "timestamp": 1771965168401
     }
   ],
   "reviewApproved": false,
