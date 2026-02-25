@@ -618,6 +618,34 @@ export type InputEventResult =
 	| { action: "handled" };
 
 // ============================================================================
+// Stream Text Event (synchronous — hot path)
+// ============================================================================
+
+/**
+ * Event emitted on each text chunk during LLM streaming.
+ *
+ * Unlike other extension events, `stream_text` handlers must be **synchronous**.
+ * They run on every streamed token; async operations would degrade streaming performance.
+ */
+export interface StreamTextExtensionEvent {
+	/** The current text delta from the LLM stream. */
+	chunk: string;
+	/** All text accumulated so far in this assistant response. */
+	accumulatedText: string;
+}
+
+/**
+ * Result returned by a `stream_text` handler.
+ * - `{ action: "continue" }`: keep streaming (default if handler returns void)
+ * - `{ action: "abort", content: ... }`: stop the stream and inject a correction message
+ *
+ * Shape intentionally matches `StreamTextResult` from `@mariozechner/pi-agent-core`.
+ */
+export type StreamTextExtensionEventResult =
+	| { action: "continue" }
+	| { action: "abort"; content: string | (TextContent | ImageContent)[] };
+
+// ============================================================================
 // Tool Events
 // ============================================================================
 
@@ -911,6 +939,16 @@ export interface RegisteredCommand {
 export type ExtensionHandler<E, R = undefined> = (event: E, ctx: ExtensionContext) => Promise<R | void> | R | void;
 
 /**
+ * Synchronous handler type for hot-path events like `stream_text`.
+ *
+ * Unlike `ExtensionHandler`, this type does NOT allow returning a Promise.
+ * Handlers run on every streamed token — async operations would degrade
+ * streaming performance and are intentionally prohibited at the type level.
+ */
+// biome-ignore lint/suspicious/noConfusingVoidType: void allows bare return statements
+export type SyncExtensionHandler<E, R = undefined> = (event: E, ctx: ExtensionContext) => R | void;
+
+/**
  * ExtensionAPI passed to extension factory functions.
  */
 export interface ExtensionAPI {
@@ -952,6 +990,17 @@ export interface ExtensionAPI {
 	on(event: "tool_result", handler: ExtensionHandler<ToolResultEvent, ToolResultEventResult>): void;
 	on(event: "user_bash", handler: ExtensionHandler<UserBashEvent, UserBashEventResult>): void;
 	on(event: "input", handler: ExtensionHandler<InputEvent, InputEventResult>): void;
+
+	/**
+	 * Register a handler for `stream_text` events.
+	 *
+	 * **Synchronous only.** This handler runs on every streamed token from the LLM.
+	 * Async operations would degrade streaming performance and are prohibited at the type level.
+	 */
+	on(
+		event: "stream_text",
+		handler: SyncExtensionHandler<StreamTextExtensionEvent, StreamTextExtensionEventResult>,
+	): void;
 
 	// =========================================================================
 	// Tool Registration
@@ -1202,7 +1251,8 @@ export interface ExtensionShortcut {
 	extensionPath: string;
 }
 
-type HandlerFn = (...args: unknown[]) => Promise<unknown>;
+// biome-ignore lint/suspicious/noConfusingVoidType: void allows bare return statements
+type HandlerFn = (...args: unknown[]) => Promise<unknown> | unknown | void;
 
 export type SendMessageHandler = <T = unknown>(
 	message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,

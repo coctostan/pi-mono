@@ -2,7 +2,7 @@
  * Extension runner - executes extensions and manages their lifecycle.
  */
 
-import type { AgentMessage } from "@mariozechner/pi-agent-core";
+import type { AgentMessage, StreamTextResult } from "@mariozechner/pi-agent-core";
 import type { ImageContent, Model } from "@mariozechner/pi-ai";
 import type { KeyId } from "@mariozechner/pi-tui";
 import { type Theme, theme } from "../../modes/interactive/theme/theme.js";
@@ -41,6 +41,8 @@ import type {
 	SessionBeforeForkResult,
 	SessionBeforeSwitchResult,
 	SessionBeforeTreeResult,
+	StreamTextExtensionEvent,
+	StreamTextExtensionEventResult,
 	ToolCallEvent,
 	ToolCallEventResult,
 	ToolResultEvent,
@@ -48,6 +50,16 @@ import type {
 	UserBashEvent,
 	UserBashEventResult,
 } from "./types.js";
+
+/** Type-safe check for Promise-like values without using `any`. */
+function isThenable(value: unknown): value is PromiseLike<unknown> {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		"then" in value &&
+		typeof (value as Record<string, unknown>).then === "function"
+	);
+}
 
 // Keybindings for these actions cannot be overridden by extensions
 const RESERVED_ACTIONS_FOR_EXTENSION_CONFLICTS: ReadonlyArray<KeyAction> = [
@@ -217,6 +229,7 @@ export class ExtensionRunner {
 	private shutdownHandler: ShutdownHandler = () => {};
 	private shortcutDiagnostics: ResourceDiagnostic[] = [];
 	private commandDiagnostics: ResourceDiagnostic[] = [];
+	private invalidStreamTextHandlers = new WeakSet<(...args: unknown[]) => unknown>();
 
 	constructor(
 		extensions: Extension[],
@@ -654,6 +667,64 @@ export class ExtensionRunner {
 		}
 
 		return undefined;
+	}
+
+	/**
+	 * Emit a stream_text event synchronously.
+	 *
+	 * Unlike other emit methods, this is synchronous because it runs on the
+	 * per-token hot path during LLM streaming. Handlers must not return Promises.
+	 *
+	 * If a handler accidentally returns a Promise (e.g. an async function),
+	 * an error is emitted and the handler result is ignored.
+	 */
+	emitStreamText(event: StreamTextExtensionEvent): StreamTextResult {
+		const ctx = this.createContext();
+
+		for (const ext of this.extensions) {
+			const handlers = ext.handlers.get("stream_text");
+			if (!handlers || handlers.length === 0) continue;
+
+			for (const handler of handlers) {
+				const streamTextHandler = handler as (...args: unknown[]) => unknown;
+				if (this.invalidStreamTextHandlers.has(streamTextHandler)) {
+					continue;
+				}
+
+				try {
+					const result = streamTextHandler(event, ctx) as StreamTextExtensionEventResult | undefined;
+
+					// Runtime guard: reject async handlers that bypass the type system
+					if (isThenable(result)) {
+						this.invalidStreamTextHandlers.add(streamTextHandler);
+						// Avoid unhandled rejections from async handlers we intentionally ignore.
+						void Promise.resolve(result).catch(() => {});
+						this.emitError({
+							extensionPath: ext.path,
+							event: "stream_text",
+							error: "stream_text handlers must be synchronous. Async handler ignored.",
+							stack: undefined,
+						});
+						continue;
+					}
+
+					if (result && result.action === "abort") {
+						return result;
+					}
+				} catch (err) {
+					const message = err instanceof Error ? err.message : String(err);
+					const stack = err instanceof Error ? err.stack : undefined;
+					this.emitError({
+						extensionPath: ext.path,
+						event: "stream_text",
+						error: message,
+						stack,
+					});
+				}
+			}
+		}
+
+		return { action: "continue" };
 	}
 
 	async emitContext(messages: AgentMessage[]): Promise<AgentMessage[]> {

@@ -303,6 +303,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		transport: settingsManager.getTransport(),
 		thinkingBudgets: settingsManager.getThinkingBudgets(),
 		maxRetryDelayMs: settingsManager.getRetrySettings().maxDelayMs,
+		onStreamText: (event) => {
+			const runner = extensionRunnerRef.current;
+			if (!runner) return { action: "continue" as const };
+			return runner.emitStreamText({
+				chunk: event.chunk,
+				accumulatedText: event.accumulatedText,
+			});
+		},
 		getApiKey: async (provider) => {
 			// Use the provider argument from the in-flight request;
 			// agent.state.model may already be switched mid-turn.

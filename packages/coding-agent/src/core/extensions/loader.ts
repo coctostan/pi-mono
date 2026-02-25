@@ -98,7 +98,8 @@ function resolvePath(extPath: string, cwd: string): string {
 	return path.resolve(cwd, expanded);
 }
 
-type HandlerFn = (...args: unknown[]) => Promise<unknown>;
+// biome-ignore lint/suspicious/noConfusingVoidType: void allows bare return statements
+type HandlerFn = (...args: unknown[]) => Promise<unknown> | unknown | void;
 
 /**
  * Create a runtime with throwing stubs for action methods.
