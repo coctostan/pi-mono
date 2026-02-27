@@ -95,7 +95,37 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * Use this for follow-up messages that should wait until the agent finishes.
 	 */
 	getFollowUpMessages?: () => Promise<AgentMessage[]>;
+
+	/**
+	 * Optional callback invoked on each text chunk during LLM streaming.
+	 *
+	 * Receives the current chunk and accumulated text. Returns either
+	 * "continue" to keep streaming, or "abort" with content to inject
+	 * as a correction message for retry.
+	 *
+	 * Synchronous -- called on the hot path of every streamed token.
+	 */
+	onStreamText?: (event: StreamTextEvent) => StreamTextResult;
 }
+
+/**
+ * Event passed to the onStreamText callback on each text chunk from the LLM.
+ */
+export interface StreamTextEvent {
+	/** The current text delta from the LLM stream. */
+	chunk: string;
+	/** All text accumulated so far in this assistant response. */
+	accumulatedText: string;
+}
+
+/**
+ * Result returned by the onStreamText callback.
+ * - "continue": keep streaming (no-op)
+ * - "abort": stop the stream and provide content to inject as a rule message
+ */
+export type StreamTextResult =
+	| { action: "continue" }
+	| { action: "abort"; content: string | (TextContent | ImageContent)[] };
 
 /**
  * Thinking/reasoning level for models that support it.
