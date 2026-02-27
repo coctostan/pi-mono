@@ -9,7 +9,15 @@ import {
 import { Type } from "@sinclair/typebox";
 import { describe, expect, it } from "vitest";
 import { agentLoop, agentLoopContinue } from "../src/agent-loop.js";
-import type { AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentTool } from "../src/types.js";
+import type {
+	AgentContext,
+	AgentEvent,
+	AgentLoopConfig,
+	AgentMessage,
+	AgentTool,
+	StreamFn,
+	StreamTextEvent,
+} from "../src/types.js";
 
 // Mock stream for testing - mimics MockAssistantStream
 class MockAssistantStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
@@ -531,5 +539,477 @@ describe("agentLoopContinue with AgentMessage", () => {
 		const messages = await stream.result();
 		expect(messages.length).toBe(1);
 		expect(messages[0].role).toBe("assistant");
+	});
+});
+
+describe("onStreamText", () => {
+	it("should call onStreamText with chunk and accumulatedText on each text_delta", async () => {
+		const context: AgentContext = {
+			systemPrompt: "",
+			messages: [],
+			tools: [],
+		};
+
+		const received: StreamTextEvent[] = [];
+
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			onStreamText: (event) => {
+				received.push({ ...event });
+				return { action: "continue" };
+			},
+		};
+
+		const streamFn = () => {
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				const partial1 = createAssistantMessage([{ type: "text", text: "Hel" }]);
+				const partial2 = createAssistantMessage([{ type: "text", text: "Hello" }]);
+				const final = createAssistantMessage([{ type: "text", text: "Hello world" }]);
+
+				stream.push({ type: "start", partial: partial1 });
+				stream.push({ type: "text_start", contentIndex: 0, partial: partial1 });
+				stream.push({ type: "text_delta", contentIndex: 0, delta: "Hel", partial: partial1 });
+				stream.push({ type: "text_delta", contentIndex: 0, delta: "lo", partial: partial2 });
+				stream.push({ type: "text_delta", contentIndex: 0, delta: " world", partial: final });
+				stream.push({ type: "text_end", contentIndex: 0, content: "Hello world", partial: final });
+				stream.push({ type: "done", reason: "stop", message: final });
+			});
+			return stream;
+		};
+
+		const stream = agentLoop([createUserMessage("hi")], context, config, undefined, streamFn);
+		for await (const _ of stream) {
+			/* consume */
+		}
+
+		expect(received).toEqual([
+			{ chunk: "Hel", accumulatedText: "Hel" },
+			{ chunk: "lo", accumulatedText: "Hello" },
+			{ chunk: " world", accumulatedText: "Hello world" },
+		]);
+	});
+
+	it("should not alter normal flow when onStreamText always returns continue", async () => {
+		const context: AgentContext = {
+			systemPrompt: "",
+			messages: [],
+			tools: [],
+		};
+
+		let callCount = 0;
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			onStreamText: () => {
+				callCount++;
+				return { action: "continue" };
+			},
+		};
+
+		const streamFn = () => {
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				const partial = createAssistantMessage([{ type: "text", text: "ok" }]);
+				const final = createAssistantMessage([{ type: "text", text: "ok" }]);
+				stream.push({ type: "start", partial });
+				stream.push({ type: "text_start", contentIndex: 0, partial });
+				stream.push({ type: "text_delta", contentIndex: 0, delta: "ok", partial });
+				stream.push({ type: "text_end", contentIndex: 0, content: "ok", partial });
+				stream.push({ type: "done", reason: "stop", message: final });
+			});
+			return stream;
+		};
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([createUserMessage("hi")], context, config, undefined, streamFn);
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		const messages = await stream.result();
+		expect(messages.length).toBe(2);
+		expect(messages[1].role).toBe("assistant");
+		expect(callCount).toBe(1);
+
+		const eventTypes = events.map((e) => e.type);
+		expect(eventTypes).toContain("agent_end");
+	});
+
+	it("should behave identically when onStreamText is not configured", async () => {
+		const context: AgentContext = {
+			systemPrompt: "",
+			messages: [],
+			tools: [],
+		};
+
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+		};
+
+		const streamFn = () => {
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				const partial = createAssistantMessage([{ type: "text", text: "ok" }]);
+				const final = createAssistantMessage([{ type: "text", text: "ok" }]);
+				stream.push({ type: "start", partial });
+				stream.push({ type: "text_start", contentIndex: 0, partial });
+				stream.push({ type: "text_delta", contentIndex: 0, delta: "ok", partial });
+				stream.push({ type: "text_end", contentIndex: 0, content: "ok", partial });
+				stream.push({ type: "done", reason: "stop", message: final });
+			});
+			return stream;
+		};
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([createUserMessage("hi")], context, config, undefined, streamFn);
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		const messages = await stream.result();
+		expect(messages.length).toBe(2);
+		expect(messages[1].role).toBe("assistant");
+
+		const eventTypes = events.map((e) => e.type);
+		expect(eventTypes).toContain("agent_end");
+	});
+
+	it("should return abort marker and remove partial message from context on onStreamText abort", async () => {
+		const context: AgentContext = {
+			systemPrompt: "",
+			messages: [],
+			tools: [],
+		};
+
+		let llmCallCount = 0;
+		let contextMessagesAtSecondCall: AgentMessage[] = [];
+
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: (msgs) => {
+				llmCallCount++;
+				if (llmCallCount === 2) {
+					contextMessagesAtSecondCall = msgs.map((m) => ({ ...m }));
+				}
+				return identityConverter(msgs);
+			},
+			onStreamText: (event) => {
+				if (event.accumulatedText.includes("bad")) {
+					return { action: "abort", content: "Do not say bad" };
+				}
+				return { action: "continue" };
+			},
+		};
+
+		const streamFn = () => {
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				if (llmCallCount <= 1) {
+					const partial1 = createAssistantMessage([{ type: "text", text: "This is " }]);
+					const partial2 = createAssistantMessage([{ type: "text", text: "This is bad stuff" }]);
+					stream.push({ type: "start", partial: partial1 });
+					stream.push({ type: "text_start", contentIndex: 0, partial: partial1 });
+					stream.push({ type: "text_delta", contentIndex: 0, delta: "This is ", partial: partial1 });
+					stream.push({ type: "text_delta", contentIndex: 0, delta: "bad stuff", partial: partial2 });
+					stream.push({ type: "text_end", contentIndex: 0, content: "This is bad stuff", partial: partial2 });
+					stream.push({ type: "done", reason: "stop", message: partial2 });
+				} else {
+					const final = createAssistantMessage([{ type: "text", text: "This is good" }]);
+					stream.push({ type: "start", partial: final });
+					stream.push({ type: "text_start", contentIndex: 0, partial: final });
+					stream.push({ type: "text_delta", contentIndex: 0, delta: "This is good", partial: final });
+					stream.push({ type: "text_end", contentIndex: 0, content: "This is good", partial: final });
+					stream.push({ type: "done", reason: "stop", message: final });
+				}
+			});
+			return stream;
+		};
+
+		const stream = agentLoop([createUserMessage("hi")], context, config, undefined, streamFn);
+		for await (const _ of stream) {
+			/* consume */
+		}
+
+		// Should have called LLM twice: first aborted, second succeeded
+		expect(llmCallCount).toBe(2);
+
+		// The partial "bad" assistant message should NOT be in context at the second call
+		const assistantInSecondCall = contextMessagesAtSecondCall.filter((m) => m.role === "assistant");
+		expect(assistantInSecondCall.length).toBe(0);
+	});
+
+	it("should inject abort content as a UserMessage and continue the loop", async () => {
+		const context: AgentContext = {
+			systemPrompt: "",
+			messages: [],
+			tools: [],
+		};
+
+		let llmCallCount = 0;
+		const llmContextSnapshots: Message[][] = [];
+
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: (msgs) => {
+				const converted = identityConverter(msgs);
+				llmContextSnapshots.push(converted.map((m) => ({ ...m })));
+				return converted;
+			},
+			onStreamText: (event) => {
+				if (event.accumulatedText.includes("forbidden")) {
+					return { action: "abort", content: "RULE: Do not use the word forbidden." };
+				}
+				return { action: "continue" };
+			},
+		};
+
+		const streamFn = () => {
+			llmCallCount++;
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				if (llmCallCount === 1) {
+					const partial = createAssistantMessage([{ type: "text", text: "forbidden" }]);
+					stream.push({ type: "start", partial });
+					stream.push({ type: "text_start", contentIndex: 0, partial });
+					stream.push({ type: "text_delta", contentIndex: 0, delta: "forbidden", partial });
+					stream.push({ type: "text_end", contentIndex: 0, content: "forbidden", partial });
+					stream.push({ type: "done", reason: "stop", message: partial });
+				} else {
+					const final = createAssistantMessage([{ type: "text", text: "allowed" }]);
+					stream.push({ type: "start", partial: final });
+					stream.push({ type: "text_start", contentIndex: 0, partial: final });
+					stream.push({ type: "text_delta", contentIndex: 0, delta: "allowed", partial: final });
+					stream.push({ type: "text_end", contentIndex: 0, content: "allowed", partial: final });
+					stream.push({ type: "done", reason: "stop", message: final });
+				}
+			});
+			return stream;
+		};
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([createUserMessage("test")], context, config, undefined, streamFn);
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		// Should have called LLM twice (abort + retry)
+		expect(llmCallCount).toBe(2);
+
+		// Second LLM call should see the injected user message
+		expect(llmContextSnapshots.length).toBe(2);
+		const secondCallMessages = llmContextSnapshots[1];
+		const injectedMsg = secondCallMessages.find(
+			(m) =>
+				m.role === "user" && typeof m.content === "string" && m.content === "RULE: Do not use the word forbidden.",
+		);
+		expect(injectedMsg).toBeDefined();
+
+		// No partial assistant message should be in the second call's context
+		const assistantInSecondCall = secondCallMessages.filter((m) => m.role === "assistant");
+		expect(assistantInSecondCall.length).toBe(0);
+
+		// The injected user message should also appear as a message event
+		const userMsgEvents = events.filter(
+			(e) =>
+				e.type === "message_start" &&
+				e.message.role === "user" &&
+				typeof e.message.content === "string" &&
+				e.message.content === "RULE: Do not use the word forbidden.",
+		);
+		expect(userMsgEvents.length).toBe(1);
+
+		// Agent should end normally
+		const agentEnd = events.find((e) => e.type === "agent_end");
+		expect(agentEnd).toBeDefined();
+	});
+
+	it("should abort stream, remove partial message, and retry with clean response", async () => {
+		const context: AgentContext = {
+			systemPrompt: "",
+			messages: [],
+			tools: [],
+		};
+
+		let llmCallCount = 0;
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			onStreamText: (event) => {
+				if (event.accumulatedText.includes("bad")) {
+					return { action: "abort", content: "Do not say bad" };
+				}
+				return { action: "continue" };
+			},
+		};
+
+		const streamFn = () => {
+			llmCallCount++;
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				if (llmCallCount === 1) {
+					const partial1 = createAssistantMessage([{ type: "text", text: "This is " }]);
+					const partial2 = createAssistantMessage([{ type: "text", text: "This is bad" }]);
+					stream.push({ type: "start", partial: partial1 });
+					stream.push({ type: "text_start", contentIndex: 0, partial: partial1 });
+					stream.push({ type: "text_delta", contentIndex: 0, delta: "This is ", partial: partial1 });
+					stream.push({ type: "text_delta", contentIndex: 0, delta: "bad", partial: partial2 });
+					stream.push({ type: "text_end", contentIndex: 0, content: "This is bad", partial: partial2 });
+					stream.push({ type: "done", reason: "stop", message: partial2 });
+				} else {
+					const final = createAssistantMessage([{ type: "text", text: "This is good" }]);
+					stream.push({ type: "start", partial: final });
+					stream.push({ type: "text_start", contentIndex: 0, partial: final });
+					stream.push({ type: "text_delta", contentIndex: 0, delta: "This is good", partial: final });
+					stream.push({ type: "text_end", contentIndex: 0, content: "This is good", partial: final });
+					stream.push({ type: "done", reason: "stop", message: final });
+				}
+			});
+			return stream;
+		};
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([createUserMessage("hi")], context, config, undefined, streamFn);
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		const messages = await stream.result();
+
+		// Should have called LLM twice (abort + retry)
+		expect(llmCallCount).toBe(2);
+
+		// Result should contain: user prompt, injected correction, and clean assistant response
+		// (not the partial "bad" message)
+		const assistantResults = messages.filter((m) => m.role === "assistant");
+		expect(assistantResults.length).toBe(1);
+		expect((assistantResults[0] as AssistantMessage).content[0]).toEqual({
+			type: "text",
+			text: "This is good",
+		});
+
+		// Agent should end normally
+		const agentEnd = events.find((e) => e.type === "agent_end");
+		expect(agentEnd).toBeDefined();
+	});
+
+	it("should reset accumulatedText for each new assistant response", async () => {
+		const context: AgentContext = {
+			systemPrompt: "",
+			messages: [],
+			tools: [],
+		};
+
+		const allAccumulated: string[] = [];
+		let abortOnce = true;
+
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			onStreamText: (event) => {
+				allAccumulated.push(event.accumulatedText);
+				if (abortOnce && event.accumulatedText === "first") {
+					abortOnce = false;
+					return { action: "abort", content: "retry" };
+				}
+				return { action: "continue" };
+			},
+		};
+
+		let llmCallCount = 0;
+		const streamFn = () => {
+			llmCallCount++;
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				if (llmCallCount === 1) {
+					const partial = createAssistantMessage([{ type: "text", text: "first" }]);
+					stream.push({ type: "start", partial });
+					stream.push({ type: "text_start", contentIndex: 0, partial });
+					stream.push({ type: "text_delta", contentIndex: 0, delta: "first", partial });
+					stream.push({ type: "text_end", contentIndex: 0, content: "first", partial });
+					stream.push({ type: "done", reason: "stop", message: partial });
+				} else {
+					const partial1 = createAssistantMessage([{ type: "text", text: "second" }]);
+					const final = createAssistantMessage([{ type: "text", text: "second!" }]);
+					stream.push({ type: "start", partial: partial1 });
+					stream.push({ type: "text_start", contentIndex: 0, partial: partial1 });
+					stream.push({ type: "text_delta", contentIndex: 0, delta: "second", partial: partial1 });
+					stream.push({ type: "text_delta", contentIndex: 0, delta: "!", partial: final });
+					stream.push({ type: "text_end", contentIndex: 0, content: "second!", partial: final });
+					stream.push({ type: "done", reason: "stop", message: final });
+				}
+			});
+			return stream;
+		};
+
+		const stream = agentLoop([createUserMessage("go")], context, config, undefined, streamFn);
+		for await (const _ of stream) {
+			/* consume */
+		}
+
+		// First response: accumulated "first" then abort
+		// Second response: accumulated "second", then "second!" — NOT "firstsecond"
+		expect(allAccumulated).toEqual(["first", "second", "second!"]);
+	});
+
+	it("should abort when outer signal fires, preserving user-cancel behavior", async () => {
+		const context: AgentContext = {
+			systemPrompt: "",
+			messages: [],
+			tools: [],
+		};
+
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			onStreamText: () => ({ action: "continue" }),
+		};
+
+		const outerController = new AbortController();
+		let childSignalAborted = false;
+
+		const streamFn: StreamFn = (_model, _ctx, options) => {
+			const passedSignal = options?.signal as AbortSignal;
+
+			const mockStream = new MockAssistantStream();
+			queueMicrotask(() => {
+				const partial = createAssistantMessage([{ type: "text", text: "" }], "aborted");
+				mockStream.push({ type: "start", partial });
+				mockStream.push({ type: "text_start", contentIndex: 0, partial });
+				mockStream.push({ type: "text_delta", contentIndex: 0, delta: "hel", partial });
+
+				// Fire outer abort
+				outerController.abort();
+
+				// The child signal should also be aborted
+				childSignalAborted = passedSignal.aborted;
+
+				// Simulate what the real stream does on abort
+				const errorMsg = createAssistantMessage([{ type: "text", text: "hel" }], "aborted");
+				mockStream.push({ type: "error", reason: "aborted", error: errorMsg });
+			});
+			return mockStream;
+		};
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([createUserMessage("hi")], context, config, outerController.signal, streamFn);
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		const messages = await stream.result();
+
+		// Child signal should have been aborted when outer signal fired
+		expect(childSignalAborted).toBe(true);
+
+		// Should have ended with aborted stop reason
+		const assistantMsg = messages.find((m) => m.role === "assistant") as AssistantMessage;
+		expect(assistantMsg.stopReason).toBe("aborted");
+
+		// Agent should end (not retry)
+		const agentEnd = events.find((e) => e.type === "agent_end");
+		expect(agentEnd).toBeDefined();
 	});
 });

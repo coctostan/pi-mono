@@ -7,8 +7,11 @@ import {
 	type AssistantMessage,
 	type Context,
 	EventStream,
+	type ImageContent,
 	streamSimple,
+	type TextContent,
 	type ToolResultMessage,
+	type UserMessage,
 	validateToolArguments,
 } from "@mariozechner/pi-ai";
 import type {
@@ -138,7 +141,21 @@ async function runLoop(
 			}
 
 			// Stream assistant response
-			const message = await streamAssistantResponse(currentContext, config, signal, stream, streamFn);
+			const streamResult = await streamAssistantResponse(currentContext, config, signal, stream, streamFn);
+
+			// Check for onStreamText abort
+			if ("aborted" in streamResult) {
+				// Convert abort content to UserMessage and set as pending
+				const correctionMessage: UserMessage = {
+					role: "user",
+					content: streamResult.content,
+					timestamp: Date.now(),
+				};
+				pendingMessages = [correctionMessage];
+				continue;
+			}
+
+			const message = streamResult;
 			newMessages.push(message);
 
 			if (message.stopReason === "error" || message.stopReason === "aborted") {
@@ -197,9 +214,15 @@ async function runLoop(
 	stream.end(newMessages);
 }
 
+/** Abort marker returned by streamAssistantResponse when onStreamText triggers an abort. */
+type StreamAbortMarker = { aborted: true; content: string | (TextContent | ImageContent)[] };
+
 /**
  * Stream an assistant response from the LLM.
  * This is where AgentMessage[] gets transformed to Message[] for the LLM.
+ *
+ * Returns either an AssistantMessage (normal completion) or an abort marker
+ * when onStreamText triggers an abort.
  */
 async function streamAssistantResponse(
 	context: AgentContext,
@@ -207,7 +230,7 @@ async function streamAssistantResponse(
 	signal: AbortSignal | undefined,
 	stream: EventStream<AgentEvent, AgentMessage[]>,
 	streamFn?: StreamFn,
-): Promise<AssistantMessage> {
+): Promise<AssistantMessage | StreamAbortMarker> {
 	// Apply context transform if configured (AgentMessage[] → AgentMessage[])
 	let messages = context.messages;
 	if (config.transformContext) {
@@ -226,6 +249,16 @@ async function streamAssistantResponse(
 
 	const streamFunction = streamFn || streamSimple;
 
+	// Child abort controller linked to outer signal
+	const childController = new AbortController();
+	if (signal) {
+		if (signal.aborted) {
+			childController.abort(signal.reason);
+		} else {
+			signal.addEventListener("abort", () => childController.abort(signal.reason), { once: true });
+		}
+	}
+
 	// Resolve API key (important for expiring tokens)
 	const resolvedApiKey =
 		(config.getApiKey ? await config.getApiKey(config.model.provider) : undefined) || config.apiKey;
@@ -233,11 +266,12 @@ async function streamAssistantResponse(
 	const response = await streamFunction(config.model, llmContext, {
 		...config,
 		apiKey: resolvedApiKey,
-		signal,
+		signal: childController.signal,
 	});
 
 	let partialMessage: AssistantMessage | null = null;
 	let addedPartial = false;
+	let accumulatedText = "";
 
 	for await (const event of response) {
 		switch (event.type) {
@@ -248,8 +282,34 @@ async function streamAssistantResponse(
 				stream.push({ type: "message_start", message: { ...partialMessage } });
 				break;
 
+			case "text_delta": {
+				if (config.onStreamText) {
+					accumulatedText += event.delta;
+					const result = config.onStreamText({ chunk: event.delta, accumulatedText });
+					if (result.action === "abort") {
+						// Remove partial assistant message from context
+						if (addedPartial) {
+							context.messages.pop();
+						}
+						// Abort the HTTP stream
+						childController.abort("onStreamText abort");
+						// Return immediately with abort marker
+						return { aborted: true, content: result.content };
+					}
+				}
+				if (partialMessage) {
+					partialMessage = event.partial;
+					context.messages[context.messages.length - 1] = partialMessage;
+					stream.push({
+						type: "message_update",
+						assistantMessageEvent: event,
+						message: { ...partialMessage },
+					});
+				}
+				break;
+			}
+
 			case "text_start":
-			case "text_delta":
 			case "text_end":
 			case "thinking_start":
 			case "thinking_delta":

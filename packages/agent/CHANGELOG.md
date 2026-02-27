@@ -6,6 +6,7 @@
 
 - Added `StreamTextEvent` and `StreamTextResult` types for mid-stream text interception
 - Added optional `onStreamText` callback to `AgentLoopConfig` for inspecting LLM text chunks and signaling abort-with-content
+- `onStreamText` is now fully wired: returning `{ action: "abort", content }` cancels the in-flight LLM stream via a child `AbortController`, discards the partial assistant message from context, injects the abort content as a `UserMessage`, and retries the turn automatically — allowing callers to enforce output rules mid-stream without ending the agent session
 
 ## [0.55.1] - 2026-02-26
 

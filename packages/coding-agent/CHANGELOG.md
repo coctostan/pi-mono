@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `stream_text` extension event with synchronous handler support for mid-stream text interception
+- Added `SyncExtensionHandler` type for hot-path extension events
+- Wired `onStreamText` from agent loop through extension runner
+
 ## [0.55.1] - 2026-02-26
 
 ### New Features

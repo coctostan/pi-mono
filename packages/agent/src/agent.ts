@@ -91,6 +91,17 @@ export interface AgentOptions {
 	 * Default: 60000 (60 seconds). Set to 0 to disable the cap.
 	 */
 	maxRetryDelayMs?: number;
+
+	/**
+	 * Optional callback invoked on each text chunk during LLM streaming.
+	 *
+	 * Receives the current chunk and accumulated text. Returns either
+	 * "continue" to keep streaming, or "abort" with content to inject
+	 * as a correction message for retry.
+	 *
+	 * Synchronous — called on the hot path of every streamed token.
+	 */
+	onStreamText?: AgentLoopConfig["onStreamText"];
 }
 
 export class Agent {
@@ -122,6 +133,7 @@ export class Agent {
 	private _thinkingBudgets?: ThinkingBudgets;
 	private _transport: Transport;
 	private _maxRetryDelayMs?: number;
+	public onStreamText?: AgentLoopConfig["onStreamText"];
 
 	constructor(opts: AgentOptions = {}) {
 		this._state = { ...this._state, ...opts.initialState };
@@ -135,6 +147,7 @@ export class Agent {
 		this._thinkingBudgets = opts.thinkingBudgets;
 		this._transport = opts.transport ?? "sse";
 		this._maxRetryDelayMs = opts.maxRetryDelayMs;
+		this.onStreamText = opts.onStreamText;
 	}
 
 	/**
@@ -443,6 +456,7 @@ export class Agent {
 				return this.dequeueSteeringMessages();
 			},
 			getFollowUpMessages: async () => this.dequeueFollowUpMessages(),
+			onStreamText: this.onStreamText,
 		};
 
 		let partial: AgentMessage | null = null;
